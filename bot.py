@@ -19,7 +19,7 @@ import uuid
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, Update, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
@@ -58,10 +58,24 @@ Base = declarative_base()
 
 def _fix_db_url(url: str) -> str:
     """Ensure async-compatible driver in DATABASE_URL."""
+    if not url or not url.strip():
+        raise ValueError(
+            "\n\n[CONFIG ERROR] DATABASE_URL не задан!\n"
+            "Добавь в .env файл:\n"
+            "DATABASE_URL=postgresql+asyncpg://user:password@host:5432/dbname\n"
+        )
+    url = url.strip()
     if url.startswith("postgres://"):
+        # Heroku / Railway shorthand
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgresql://") and "+asyncpg" not in url:
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif not url.startswith("postgresql"):
+        raise ValueError(
+            f"\n\n[CONFIG ERROR] Неверный формат DATABASE_URL: '{url[:60]}'\n"
+            "Ожидается: postgresql+asyncpg://user:password@host:5432/dbname\n"
+        )
+    logging.getLogger(__name__).info(f"DB driver: {url.split('://')[0]}")
     return url
 
 engine = create_async_engine(_fix_db_url(settings.DATABASE_URL), echo=False, pool_pre_ping=True, pool_size=10, max_overflow=20)
@@ -393,7 +407,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("👋 Привет! Я Алекс — твой учитель английского!\n\nДавай начнём — это займёт 1 минуту.", reply_markup=get_onboarding_keyboard())
         await message.answer("Какой у тебя уровень английского?", reply_markup=get_level_keyboard())
 
-@router.callback_query(F.data.startswith("level_"), state=OnboardingStates.waiting_level_choice)
+@router.callback_query(F.data.startswith("level_"), StateFilter(OnboardingStates.waiting_level_choice))
 async def onboarding_level(callback: CallbackQuery, state: FSMContext):
     level_map = {"level_beginner": "A1", "level_elementary": "A2", "level_intermediate": "B1", "level_upper": "B2", "level_advanced": "C1", "level_proficient": "C2"}
     if callback.data == "level_dont_know":
@@ -410,7 +424,7 @@ async def onboarding_level(callback: CallbackQuery, state: FSMContext):
         await state.set_state(OnboardingStates.waiting_focus_areas)
         await callback.message.answer("Что хочешь прокачать? (можно несколько)", reply_markup=get_focus_areas_keyboard([]))
 
-@router.callback_query(F.data.startswith("area_"), state=OnboardingStates.waiting_focus_areas)
+@router.callback_query(F.data.startswith("area_"), StateFilter(OnboardingStates.waiting_focus_areas))
 async def toggle_area(callback: CallbackQuery, state: FSMContext):
     area = callback.data.replace("area_", "")
     data = await state.get_data()
@@ -421,7 +435,7 @@ async def toggle_area(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=get_focus_areas_keyboard(selected))
 
-@router.callback_query(F.data == "areas_done", state=OnboardingStates.waiting_focus_areas)
+@router.callback_query(F.data == "areas_done", StateFilter(OnboardingStates.waiting_focus_areas))
 async def areas_done(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected = data.get("selected_areas", [])
@@ -433,7 +447,7 @@ async def areas_done(callback: CallbackQuery, state: FSMContext):
     await state.set_state(OnboardingStates.waiting_bot_mode)
     await callback.message.edit_text("Выбери режим обучения:", reply_markup=get_bot_mode_keyboard())
 
-@router.callback_query(F.data.startswith("mode_"), state=OnboardingStates.waiting_bot_mode)
+@router.callback_query(F.data.startswith("mode_"), StateFilter(OnboardingStates.waiting_bot_mode))
 async def choose_mode(callback: CallbackQuery, state: FSMContext):
     mode = callback.data.replace("mode_", "")
     await state.update_data(bot_mode=mode)
@@ -441,7 +455,7 @@ async def choose_mode(callback: CallbackQuery, state: FSMContext):
     await state.set_state(OnboardingStates.waiting_notify_time)
     await callback.message.edit_text("В какое время присылать напоминания?\nВведи в формате ЧЧ:ММ, например: 09:00\nМожно несколько — каждое с новой строки")
 
-@router.message(state=OnboardingStates.waiting_notify_time)
+@router.message(StateFilter(OnboardingStates.waiting_notify_time))
 async def set_notify_time(message: Message, state: FSMContext):
     times = [l.strip() for l in message.text.strip().split("\n") if re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", l.strip())]
     if not times:
@@ -451,7 +465,7 @@ async def set_notify_time(message: Message, state: FSMContext):
     await state.set_state(OnboardingStates.waiting_timezone)
     await message.answer("Выбери часовой пояс:", reply_markup=get_timezone_keyboard())
 
-@router.callback_query(F.data.startswith("tz_"), state=OnboardingStates.waiting_timezone)
+@router.callback_query(F.data.startswith("tz_"), StateFilter(OnboardingStates.waiting_timezone))
 async def choose_tz(callback: CallbackQuery, state: FSMContext):
     tz_map = {"tz_moscow": "Europe/Moscow", "tz_ekb": "Asia/Yekaterinburg", "tz_tashkent": "Asia/Tashkent"}
     if callback.data == "tz_other":
@@ -462,7 +476,7 @@ async def choose_tz(callback: CallbackQuery, state: FSMContext):
         await state.update_data(timezone=tz_map[callback.data])
         await finish_onboarding(callback.message, state)
 
-@router.message(state=OnboardingStates.waiting_timezone)
+@router.message(StateFilter(OnboardingStates.waiting_timezone))
 async def custom_tz(message: Message, state: FSMContext):
     tz = message.text.strip()
     if re.match(r"^[+-]?\d{1,2}$", tz):
@@ -478,7 +492,7 @@ async def send_test_question(message: Message, state: FSMContext, num: int):
     await state.update_data(current_question=q_data, test_question_num=num)
     await message.answer(f"❓ Вопрос {num+1}/5:\n\n{fallback_q[num][0]}", reply_markup=get_quiz_keyboard(fallback_q[num][1]))
 
-@router.callback_query(F.data.startswith("quiz_"), state=OnboardingStates.waiting_test_answer)
+@router.callback_query(F.data.startswith("quiz_"), StateFilter(OnboardingStates.waiting_test_answer))
 async def test_answer(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     num = data.get("test_question_num", 0)
@@ -525,7 +539,7 @@ async def start_lesson(callback: CallbackQuery, state: FSMContext):
     await state.set_state(LessonStates.in_lesson)
     await callback.message.edit_text("Какой тип урока?", reply_markup=get_lesson_type_keyboard())
 
-@router.callback_query(F.data.startswith("lesson_"), state=LessonStates.in_lesson)
+@router.callback_query(F.data.startswith("lesson_"), StateFilter(LessonStates.in_lesson))
 async def handle_lesson_type(callback: CallbackQuery, state: FSMContext):
     lesson_type = callback.data.replace("lesson_", "")
     user = await get_user(callback.from_user.id)
@@ -566,7 +580,7 @@ async def handle_lesson_type(callback: CallbackQuery, state: FSMContext):
             q = questions[0]
             await callback.message.answer(f"❓ {q.get('question', '')}", reply_markup=get_lesson_answer_keyboard(q.get("options", [])))
 
-@router.callback_query(F.data.startswith("answer_"), state=LessonStates.waiting_answer)
+@router.callback_query(F.data.startswith("answer_"), StateFilter(LessonStates.waiting_answer))
 async def handle_answer(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     answer_idx = int(callback.data.replace("answer_", ""))
@@ -611,7 +625,7 @@ async def handle_answer(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("🎉 Урок завершён!", reply_markup=get_lesson_continue_keyboard())
     if is_correct: await update_user_after_lesson(callback.from_user.id, lesson_type)
 
-@router.message(state=LessonStates.waiting_answer)
+@router.message(StateFilter(LessonStates.waiting_answer))
 async def handle_free_answer(message: Message, state: FSMContext):
     data = await state.get_data()
     lesson_type = data.get("lesson_type", "")
@@ -626,7 +640,7 @@ async def handle_free_answer(message: Message, state: FSMContext):
         await message.answer("📝 Спасибо за ответ!")
     await message.answer("Продолжим?", reply_markup=get_lesson_continue_keyboard())
 
-@router.callback_query(F.data == "lesson_continue", state=LessonStates.waiting_answer)
+@router.callback_query(F.data == "lesson_continue", StateFilter(LessonStates.waiting_answer))
 async def continue_lesson(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Выбери урок:")
     await callback.message.answer("Какой тип урока?", reply_markup=get_lesson_type_keyboard())
