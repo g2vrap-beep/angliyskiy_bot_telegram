@@ -29,7 +29,7 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Text, DateTime, Date, ForeignKey, ARRAY, select, update, func, and_, or_
 from sqlalchemy.dialects.postgresql import UUID as PGUUID, JSONB
 from openai import AsyncOpenAI, RateLimitError, APIConnectionError, APIStatusError
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.asyncio import AsyncIOScheduler
 
 # ============= КОНФИГУРАЦИЯ =============
 load_dotenv()
