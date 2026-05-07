@@ -18,6 +18,7 @@ import uuid
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message, CallbackQuery, Update, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -83,7 +84,7 @@ AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_co
 
 # ============= МОДЕЛИ =============
 class User(Base):
-    __tablename__ = "users"
+    __tablename__ = "eng_users"
     id = Column(BigInteger, primary_key=True)
     username = Column(String(64), nullable=True)
     full_name = Column(String(128), nullable=True)
@@ -133,9 +134,9 @@ class User(Base):
         return names.get(self.xp_level, "💎 Легенда")
 
 class Lesson(Base):
-    __tablename__ = "lessons"
+    __tablename__ = "eng_lessons"
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    user_id = Column(BigInteger, ForeignKey("eng_users.id"), nullable=False)
     lesson_type = Column(String(32))
     content = Column(JSONB)
     user_answer = Column(Text)
@@ -146,18 +147,18 @@ class Lesson(Base):
     completed_at = Column(DateTime, nullable=True)
 
 class Notification(Base):
-    __tablename__ = "notifications"
+    __tablename__ = "eng_notifications"
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    user_id = Column(BigInteger, ForeignKey("eng_users.id"), nullable=False)
     scheduled_at = Column(DateTime)
     sent_at = Column(DateTime, nullable=True)
     ignored = Column(Boolean, default=False)
     reminder_count = Column(Integer, default=0)
 
 class Payment(Base):
-    __tablename__ = "payments"
+    __tablename__ = "eng_payments"
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    user_id = Column(BigInteger, ForeignKey("eng_users.id"), nullable=False)
     telegram_payment_id = Column(String(256), nullable=True)
     amount = Column(Integer)
     currency = Column(String(8))
@@ -165,16 +166,16 @@ class Payment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Badge(Base):
-    __tablename__ = "badges"
+    __tablename__ = "eng_badges"
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    user_id = Column(BigInteger, ForeignKey("eng_users.id"), nullable=False)
     badge_id = Column(String(64))
     earned_at = Column(DateTime, default=datetime.utcnow)
 
 class Gift(Base):
-    __tablename__ = "gifts"
+    __tablename__ = "eng_gifts"
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    user_id = Column(BigInteger, ForeignKey("eng_users.id"), nullable=False)
     admin_id = Column(BigInteger)
     days = Column(Integer)
     note = Column(String(256), nullable=True)
@@ -859,7 +860,7 @@ async def main():
     except Exception as e:
         logger.error(f"Failed to create tables: {e}")
     
-    bot = Bot(token=settings.BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     setup_scheduler(bot)
     logger.info("Starting EnglishBot...")
     if settings.WEBHOOK_URL:
