@@ -30,6 +30,7 @@ from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Text, DateT
 from sqlalchemy.dialects.postgresql import UUID as PGUUID, JSONB
 from openai import AsyncOpenAI, RateLimitError, APIConnectionError, APIStatusError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
 
 # ============= КОНФИГУРАЦИЯ =============
 load_dotenv()
@@ -55,7 +56,15 @@ logger = logging.getLogger(__name__)
 # ============= БАЗА ДАННЫХ =============
 Base = declarative_base()
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False, pool_pre_ping=True, pool_size=10, max_overflow=20)
+def _fix_db_url(url: str) -> str:
+    """Ensure async-compatible driver in DATABASE_URL."""
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://") and "+asyncpg" not in url:
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+engine = create_async_engine(_fix_db_url(settings.DATABASE_URL), echo=False, pool_pre_ping=True, pool_size=10, max_overflow=20)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # ============= МОДЕЛИ =============
@@ -384,7 +393,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("👋 Привет! Я Алекс — твой учитель английского!\n\nДавай начнём — это займёт 1 минуту.", reply_markup=get_onboarding_keyboard())
         await message.answer("Какой у тебя уровень английского?", reply_markup=get_level_keyboard())
 
-@router.callback_query(F.data == "onboarding_done", state=OnboardingStates.waiting_level_choice)
+@router.callback_query(F.data.startswith("level_"), state=OnboardingStates.waiting_level_choice)
 async def onboarding_level(callback: CallbackQuery, state: FSMContext):
     level_map = {"level_beginner": "A1", "level_elementary": "A2", "level_intermediate": "B1", "level_upper": "B2", "level_advanced": "C1", "level_proficient": "C2"}
     if callback.data == "level_dont_know":
@@ -620,7 +629,7 @@ async def handle_free_answer(message: Message, state: FSMContext):
 @router.callback_query(F.data == "lesson_continue", state=LessonStates.waiting_answer)
 async def continue_lesson(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Выбери урок:")
-    await callback.message.answer(reply_markup=get_lesson_type_keyboard())
+    await callback.message.answer("Какой тип урока?", reply_markup=get_lesson_type_keyboard())
 
 @router.callback_query(F.data == "lesson_end")
 async def end_lesson(callback: CallbackQuery, state: FSMContext):
@@ -806,9 +815,13 @@ scheduler = AsyncIOScheduler()
 
 async def send_daily(bot: Bot):
     users = await get_all_users(500)
-    now = datetime.utcnow().strftime("%H:%M")
     for user in users:
         if not user.has_active_access(): continue
+        try:
+            tz = pytz.timezone(user.timezone) if user.timezone else pytz.utc
+        except pytz.exceptions.UnknownTimeZoneError:
+            tz = pytz.utc
+        now = datetime.now(tz).strftime("%H:%M")
         if now in (user.notify_times or []):
             try:
                 await bot.send_message(user.id, "☀️ Доброе утро!\n\nГотов к уроку? 📚", reply_markup=get_lesson_type_keyboard())
@@ -816,7 +829,7 @@ async def send_daily(bot: Bot):
             except: pass
 
 def setup_scheduler(bot: Bot):
-    scheduler.add_job(send_daily, "cron", minute="*", args=[bot], id="daily")
+    scheduler.add_job(send_daily, "cron", minute="*", args=[bot], id="send_daily", replace_existing=True)
     scheduler.start()
 
 async def main():
