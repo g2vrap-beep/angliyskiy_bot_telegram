@@ -2119,6 +2119,7 @@ async def main():
     bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     setup_scheduler(bot)
     logger.info("Starting EnglishBot...")
+    logger.info(f"ADMIN_IDS: {settings.ADMIN_IDS}")
 
     if settings.WEBHOOK_URL:
         await bot.set_webhook(f"{settings.WEBHOOK_URL}/webhook", secret_token=settings.WEBHOOK_SECRET)
