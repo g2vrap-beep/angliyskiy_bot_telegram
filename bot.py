@@ -1796,6 +1796,7 @@ async def cmd_admin(message: Message):
         "/admin_users — пользователи\n"
         "/admin_user ID — инфо о пользователе\n"
         "/admin_gift ID [дни] — подарить доступ\n"
+        "/admin_reset ID — полный сброс (для тестов)\n"
         "/admin_ban ID — забанить\n"
         "/admin_unban ID — разбанить",
         parse_mode="HTML",
@@ -1882,6 +1883,77 @@ async def admin_unban(message: Message):
         await message.answer(f"✅ {uid} разблокирован")
     except:
         await message.answer("Использование: /admin_unban ID")
+
+@router.message(Command("admin_reset"))
+async def admin_reset(message: Message):
+    """Полный сброс статистики пользователя для тестирования."""
+    if not is_admin(message.from_user.id): return
+    try:
+        uid = int(message.text.split()[1])
+        user = await get_user(uid)
+        if not user:
+            await message.answer("❌ Пользователь не найден")
+            return
+        # Сбрасываем все поля статистики
+        await update_user(
+            uid,
+            streak=0,
+            longest_streak=0,
+            total_lessons=0,
+            xp_total=0,
+            xp_level=1,
+            lessons_perfect=0,
+            ielts_lessons=0,
+            last_lesson_date=None,
+            trial_started=datetime.utcnow(),
+            subscription_end=None,
+            is_subscribed=False,
+            # Сбрасываем онбординг — бот пройдёт его заново
+            level="B1",
+            focus_areas=["vocabulary"],
+            bot_mode="casual",
+            learning_style=None,
+            display_name=None,
+            notify_times=["09:00"],
+            timezone="UTC",
+            voice_count_today=0,
+            photo_count_today=0,
+            media_reset_at=None,
+        )
+        # Удаляем бейджи, историю уроков, память и чат
+        async with AsyncSessionLocal() as db:
+            await db.execute(update(Badge).where(Badge.user_id == uid).values())
+            # Удаляем бейджи
+            result = await db.execute(select(Badge).where(Badge.user_id == uid))
+            for b in result.scalars().all():
+                await db.delete(b)
+            # Удаляем историю уроков
+            result = await db.execute(select(Lesson).where(Lesson.user_id == uid))
+            for l in result.scalars().all():
+                await db.delete(l)
+            # Удаляем память
+            result = await db.execute(select(UserMemory).where(UserMemory.user_id == uid))
+            for m in result.scalars().all():
+                await db.delete(m)
+            # Удаляем историю чата
+            result = await db.execute(select(ChatMessage).where(ChatMessage.user_id == uid))
+            for c in result.scalars().all():
+                await db.delete(c)
+            await db.commit()
+        await message.answer(
+            f"✅ Пользователь <b>{uid}</b> полностью сброшен:\n\n"
+            f"• Статистика → 0\n"
+            f"• Бейджи → удалены\n"
+            f"• История уроков → удалена\n"
+            f"• Память (слабые места) → удалена\n"
+            f"• История чата → удалена\n"
+            f"• Онбординг → начнётся заново при /start\n"
+            f"• Пробный период → перезапущен (30 дней)",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"admin_reset error: {e}")
+        await message.answer("Использование: /admin_reset ID")
 
 # ============================================================
 #  MAIN
