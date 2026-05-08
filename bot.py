@@ -12,8 +12,6 @@ import time
 from datetime import datetime, timedelta, date
 from uuid import UUID
 from collections import defaultdict
-from contextlib import asynccontextmanager
-from pathlib import Path
 import uuid
 
 from dotenv import load_dotenv
@@ -27,7 +25,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Text, DateTime, Date, ForeignKey, ARRAY, select, update, func, and_, or_
+from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Text, DateTime, Date, ForeignKey, ARRAY, select, update, delete, func, and_, or_
 from sqlalchemy.dialects.postgresql import UUID as PGUUID, JSONB
 from openai import AsyncOpenAI, RateLimitError, APIConnectionError, APIStatusError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -123,7 +121,7 @@ class User(Base):
         if self.is_subscribed: return True
         if self.subscription_end and self.subscription_end > datetime.utcnow(): return True
         if self.trial_started:
-            return (self.trial_started + timedelta(days=30)) > datetime.utcnow()
+            return (self.trial_started + timedelta(days=settings.TRIAL_DAYS)) > datetime.utcnow()
         return False
 
     def get_xp_for_next_level(self):
@@ -371,12 +369,8 @@ async def add_chat_message(user_id: int, role: str, content: str):
         old_ids = result.scalars().all()
         if old_ids:
             await db.execute(
-                update(ChatMessage).where(ChatMessage.id.in_(old_ids))
+                delete(ChatMessage).where(ChatMessage.id.in_(old_ids))
             )
-            for oid in old_ids:
-                old = await db.get(ChatMessage, oid)
-                if old:
-                    await db.delete(old)
             await db.commit()
 
 # ============= OPENROUTER =============
@@ -531,8 +525,20 @@ async def generate_with_retry(prompt: str, system: str, **kwargs) -> dict:
                 response_format={"type": "json_object"},
                 temperature=0.7, max_tokens=1500, **kwargs
             )
-            return json.loads(resp.choices[0].message.content)
-        except (RateLimitError, json.JSONDecodeError, APIConnectionError) as e:
+            content = resp.choices[0].message.content
+            if not content:
+                raise ValueError("Empty response from model")
+            return json.loads(content)
+        except (RateLimitError, APIConnectionError, APIStatusError) as e:
+            logger.warning(f"generate_with_retry API error (attempt {attempt+1}): {e}")
+            if attempt < 2: await asyncio.sleep(5 * (attempt + 1))
+            else: return None
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"generate_with_retry parse error (attempt {attempt+1}): {e}")
+            if attempt < 2: await asyncio.sleep(2)
+            else: return None
+        except Exception as e:
+            logger.error(f"generate_with_retry unexpected error (attempt {attempt+1}): {e}")
             if attempt < 2: await asyncio.sleep(5 * (attempt + 1))
             else: return None
 
@@ -860,13 +866,13 @@ async def cmd_start(message: Message, state: FSMContext):
     )
 
     # Уже зарегистрирован — показываем меню
-    if not created and user.level and user.focus_areas and user.bot_mode:
+    if not created and user.level and user.focus_areas is not None and user.bot_mode:
         status = "🟢 Активна" if user.has_active_access() else "🔴 Истекла"
         name = user.get_display_name()
         await message.answer(
             f"👋 Привет, {name}!\n\n"
             f"📊 Уровень: {user.level}\n"
-            f"⏰ Расписание: {', '.join(user.notify_times)}\n"
+            f"⏰ Расписание: {', '.join(user.notify_times or ['09:00'])}\n"
             f"💳 Подписка: {status}\n\n"
             f"Что хочешь сделать?",
             reply_markup=get_main_menu_keyboard()
@@ -946,7 +952,7 @@ async def send_test_question(message: Message, state: FSMContext, num: int):
     await state.update_data(test_question_num=num)
     kb = get_quiz_keyboard(q["options"], show_back=(num > 0))
     await message.answer(
-        f"❓ <b>Вопрос {num + 1}/5</b>\n\n{q['question']}",
+        f"❓ <b>Вопрос {num + 1}/{len(LEVEL_TEST_QUESTIONS)}</b>\n\n{q['question']}",
         parse_mode="HTML",
         reply_markup=kb,
     )
@@ -977,7 +983,7 @@ async def test_answer(callback: CallbackQuery, state: FSMContext):
     await state.update_data(test_answers=answers)
 
     next_num = num + 1
-    if next_num < 5:
+    if next_num < len(LEVEL_TEST_QUESTIONS):
         await state.update_data(test_question_num=next_num)
         await send_test_question(callback.message, state, next_num)
     else:
@@ -995,14 +1001,14 @@ async def test_answer(callback: CallbackQuery, state: FSMContext):
         # Список ошибок
         errors = [
             f"• {LEVEL_TEST_QUESTIONS[i]['question']} → {answers[i]['explanation']}"
-            for i in range(5)
+            for i in range(len(LEVEL_TEST_QUESTIONS))
             if not answers[i]["is_correct"] and answers[i].get("explanation")
         ]
         error_text = "\n" + "\n".join(errors) if errors else ""
 
         await callback.message.answer(
             f"🎉 <b>Тест завершён!</b>\n\n"
-            f"Правильных ответов: <b>{correct_total}/5</b>\n"
+            f"Правильных ответов: <b>{correct_total}/{len(LEVEL_TEST_QUESTIONS)}</b>\n"
             f"Твой уровень: <b>{level_names.get(level, level)} ({level})</b>\n"
             f"{error_text}\n\n"
             f"<b>Шаг 3 из 7.</b> Что хочешь прокачать?",
@@ -1134,7 +1140,11 @@ async def custom_tz(message: Message, state: FSMContext):
     if re.match(r"^[+-]?\d{1,2}$", tz):
         if not tz.startswith(("+", "-")):
             tz = "+" + tz
-        await state.update_data(timezone=f"UTC{tz}")
+        offset = int(tz)
+        # pytz использует Etc/GMT с обратным знаком (POSIX): UTC+3 → Etc/GMT-3
+        etc_sign = "-" if offset >= 0 else "+"
+        tz_name = f"Etc/GMT{etc_sign}{abs(offset)}" if offset != 0 else "UTC"
+        await state.update_data(timezone=tz_name)
         await show_plan_step(message, state, message.from_user.id)
     else:
         await message.answer("❌ Неверный формат. Введи число, например: <code>+3</code>", parse_mode="HTML")
@@ -1209,7 +1219,7 @@ async def plan_confirmed(callback: CallbackQuery, state: FSMContext):
     name = user.get_display_name() if user else "друг"
     await callback.message.edit_text(
         f"🚀 <b>Поехали, {name}!</b>\n\n"
-        f"Пробный период активирован — <b>30 дней бесплатно</b>.\n\n"
+        f"Пробный период активирован — <b>{settings.TRIAL_DAYS} дней бесплатно</b>.\n\n"
         f"Выбери, с чего начнём:",
         parse_mode="HTML",
         reply_markup=get_main_menu_keyboard(),
@@ -1330,13 +1340,15 @@ async def cmd_lesson(message: Message, state: FSMContext):
     if not user.has_active_access():
         await message.answer("⏰ Требуется активная подписка")
         return
+    if user.is_blocked:
+        return
     await state.set_state(LessonStates.in_lesson)
     await message.answer("Какой тип урока?", reply_markup=get_lesson_type_keyboard())
 
 @router.callback_query(F.data == "start_lesson")
 async def start_lesson(callback: CallbackQuery, state: FSMContext):
     user = await get_user(callback.from_user.id)
-    if not user or not user.has_active_access():
+    if not user or user.is_blocked or not user.has_active_access():
         await callback.answer("⏰ Подписка требуется!", show_alert=True)
         return
     await state.set_state(LessonStates.in_lesson)
@@ -1345,6 +1357,9 @@ async def start_lesson(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("lesson_"), StateFilter(LessonStates.in_lesson))
 async def handle_lesson_type(callback: CallbackQuery, state: FSMContext):
     lesson_type = callback.data.replace("lesson_", "")
+    if not rate_limiter.check(callback.from_user.id, "lesson"):
+        await callback.answer("⏳ Не так быстро!", show_alert=True)
+        return
     user = await get_user(callback.from_user.id)
     if not user:
         await callback.answer("Сначала /start", show_alert=True)
@@ -1389,9 +1404,8 @@ async def handle_lesson_type(callback: CallbackQuery, state: FSMContext):
     elif lesson_type == "grammar":
         topic = content.get("topic", "")
         explanation = content.get("explanation", "")
-        example = content.get("example_correct", "")
         await callback.message.answer(
-            f"📖 <b>Грамматика: {topic}</b>\n\n{explanation}\n\n<i>Example:</i> {example}",
+            f"📖 <b>Грамматика: {topic}</b>\n\n{explanation}",
             parse_mode="HTML",
         )
         exercises = content.get("exercises", [])
@@ -1436,7 +1450,8 @@ async def handle_answer(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     answer_idx = int(callback.data.replace("answer_", ""))
     lesson_type = data.get("lesson_type", "")
-    lesson_id = UUID(data.get("lesson_id", ""))
+    lesson_id_str = data.get("lesson_id")
+    lesson_id = UUID(lesson_id_str) if lesson_id_str else None
     content = data.get("content", {})
     is_correct = False
     feedback = ""
@@ -1444,7 +1459,9 @@ async def handle_answer(callback: CallbackQuery, state: FSMContext):
     if lesson_type == "vocabulary":
         correct_idx = content.get("quiz", {}).get("correct_index", 0)
         is_correct = answer_idx == correct_idx
-        feedback = "✅ Правильно!" if is_correct else f"❌ Неправильно. Правильный: {content['quiz']['options'][correct_idx]}"
+        options = content.get("quiz", {}).get("options", [])
+        correct_word = options[correct_idx] if correct_idx < len(options) else "?"
+        feedback = "✅ Правильно!" if is_correct else f"❌ Неправильно. Правильный: {correct_word}"
 
     elif lesson_type == "grammar":
         exercises = data.get("exercises", [])
@@ -1487,7 +1504,8 @@ async def handle_answer(callback: CallbackQuery, state: FSMContext):
             return
 
     await callback.answer(feedback)
-    await update_lesson(lesson_id, completed_at=datetime.utcnow(), is_correct=is_correct, user_answer=str(answer_idx))
+    if lesson_id:
+        await update_lesson(lesson_id, completed_at=datetime.utcnow(), is_correct=is_correct, user_answer=str(answer_idx))
     await update_user_after_lesson(callback.from_user.id, lesson_type, is_perfect=is_correct)
 
     # Записываем пройденную тему
@@ -1561,9 +1579,11 @@ async def handle_free_answer(message: Message, state: FSMContext):
     # Запоминаем пройденную тему
     topic = content.get("task", content.get("situation", lesson_type))
     await mark_topic_done(message.from_user.id, lesson_type, str(topic)[:40])
+    # Переводим в in_lesson чтобы повторное сообщение не засчиталось дважды
+    await state.set_state(LessonStates.in_lesson)
     await message.answer("Продолжим?", reply_markup=get_lesson_continue_keyboard())
 
-@router.callback_query(F.data == "lesson_continue", StateFilter(LessonStates.waiting_answer))
+@router.callback_query(F.data == "lesson_continue", StateFilter(LessonStates.waiting_answer, LessonStates.in_lesson))
 async def continue_lesson(callback: CallbackQuery, state: FSMContext):
     await state.set_state(LessonStates.in_lesson)
     await callback.message.edit_text("Какой тип урока?", reply_markup=get_lesson_type_keyboard())
@@ -1624,26 +1644,67 @@ async def update_user_after_lesson(user_id: int, lesson_type: str, is_perfect: b
 #  Голос / Фото
 # ============================================================
 @router.message(F.voice)
-async def handle_voice(message: Message, bot: Bot):
+async def handle_voice(message: Message, bot: Bot, state: FSMContext):
     user = await get_user(message.from_user.id)
-    if not user or not user.has_active_access(): return
+    if not user or user.is_blocked or not user.has_active_access(): return
+    if not rate_limiter.check(message.from_user.id, "voice"):
+        await message.answer("⏳ Голосовые сообщения — не чаще одного раз в 15 секунд.")
+        return
     await message.answer("🎤 Распознаю...")
     try:
         file = await bot.get_file(message.voice.file_id)
         file_bytes = await bot.download_file(file.file_path)
         transcript = await transcribe_audio(file_bytes.getvalue())
-        if transcript:
-            await message.answer(f"📝 Ты сказал: {transcript}")
-            await message.answer("Отличное произношение! 🎯")
-        else:
+        if not transcript:
             await message.answer("😔 Не удалось распознать. Попробуй написать текстом.")
-    except:
+            return
+        await message.answer(f"📝 Ты сказал: <i>{transcript}</i>", parse_mode="HTML")
+        # Если пользователь в уроке — обрабатываем как текстовый ответ
+        current_state = await state.get_state()
+        if current_state == LessonStates.waiting_answer.state:
+            data = await state.get_data()
+            lesson_type = data.get("lesson_type", "")
+            lesson_id_str = data.get("lesson_id", "")
+            content = data.get("content", {})
+            task = content.get("task", "")
+            result = await evaluate_answer(transcript, task, user.level)
+            if result:
+                await message.answer(f"📝 {result.get('praise', 'Хорошо!')}")
+                if result.get("tip"):
+                    await message.answer(f"💡 {result['tip']}")
+            else:
+                await message.answer("📝 Спасибо за ответ!")
+            if lesson_id_str:
+                try:
+                    is_perfect = bool(result and result.get("score", 0) >= 7)
+                    await update_lesson(
+                        UUID(lesson_id_str),
+                        completed_at=datetime.utcnow(),
+                        is_correct=is_perfect,
+                        user_answer=transcript[:500],
+                        voice_transcript=transcript,
+                        input_type="voice",
+                    )
+                except Exception:
+                    is_perfect = False
+            else:
+                is_perfect = False
+            await update_user_after_lesson(message.from_user.id, lesson_type, is_perfect=is_perfect)
+            topic = content.get("task", content.get("situation", lesson_type))
+            await mark_topic_done(message.from_user.id, lesson_type, str(topic)[:40])
+            await message.answer("Продолжим?", reply_markup=get_lesson_continue_keyboard())
+        else:
+            await message.answer("Отличное произношение! 🎯")
+    except Exception:
         await message.answer("😔 Ошибка")
 
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
     user = await get_user(message.from_user.id)
-    if not user or not user.has_active_access(): return
+    if not user or user.is_blocked or not user.has_active_access(): return
+    if not rate_limiter.check(message.from_user.id, "photo"):
+        await message.answer("⏳ Фото — не чаще одного раза в 15 секунд.")
+        return
     await message.answer("📷 Анализирую...")
     try:
         photo = message.photo[-1]
@@ -1671,9 +1732,14 @@ async def handle_free_chat(message: Message):
     """Любое текстовое сообщение вне FSM → живой диалог с Алексом."""
     if message.text.startswith("/"):
         return  # команды обрабатываются отдельно
+    if not rate_limiter.check(message.from_user.id, "default"):
+        await message.answer("⏳ Подожди секунду и попробуй снова.")
+        return
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer("Привет! Напиши /start чтобы начать 😊")
+        return
+    if user.is_blocked:
         return
     if not user.has_active_access():
         await message.answer(
@@ -1686,7 +1752,11 @@ async def handle_free_chat(message: Message):
         return
     await message.bot.send_chat_action(message.chat.id, "typing")
     reply = await chat_with_alex(message.from_user.id, message.text)
-    await message.answer(reply, parse_mode="HTML")
+    try:
+        await message.answer(reply, parse_mode="HTML")
+    except TelegramAPIError:
+        # Если HTML не валидный — отправляем без разметки
+        await message.answer(reply)
 
 
 @router.message(Command("stats"))
@@ -1799,6 +1869,23 @@ async def cmd_admin(message: Message):
         "/admin_reset ID — полный сброс (для тестов)\n"
         "/admin_ban ID — забанить\n"
         "/admin_unban ID — разбанить",
+        parse_mode="HTML",
+    )
+
+@router.message(Command("admin_users"))
+async def admin_users(message: Message):
+    if not is_admin(message.from_user.id): return
+    users = await get_all_users(20)
+    if not users:
+        await message.answer("Пользователей нет.")
+        return
+    lines = []
+    for u in users:
+        status = "✅" if u.has_active_access() else "🔴"
+        name = u.display_name or u.full_name or u.username or "N/A"
+        lines.append(f"{status} <b>{name}</b> | ID: <code>{u.id}</code> | Уроков: {u.total_lessons}")
+    await message.answer(
+        f"👥 <b>Последние {len(users)} пользователей:</b>\n\n" + "\n".join(lines),
         parse_mode="HTML",
     )
 
@@ -1922,7 +2009,6 @@ async def admin_reset(message: Message):
         )
         # Удаляем бейджи, историю уроков, память и чат
         async with AsyncSessionLocal() as db:
-            await db.execute(update(Badge).where(Badge.user_id == uid).values())
             # Удаляем бейджи
             result = await db.execute(select(Badge).where(Badge.user_id == uid))
             for b in result.scalars().all():
@@ -1968,6 +2054,7 @@ async def send_daily(bot: Bot):
     users = await get_all_users(500)
     for user in users:
         if not user.has_active_access(): continue
+        if user.is_blocked: continue
         try:
             tz = pytz.timezone(user.timezone) if user.timezone else pytz.utc
         except pytz.exceptions.UnknownTimeZoneError:
