@@ -2145,5 +2145,14 @@ async def main():
         await bot.delete_webhook()
         await dp.start_polling(bot)
 
+@router.message(Command("admin_debug"))
+async def admin_debug(message: Message):
+    await message.answer(
+        f"Your ID: `{message.from_user.id}`\n"
+        f"ADMIN_IDS: `{settings.ADMIN_IDS}`\n"
+        f"Is admin: `{is_admin(message.from_user.id)}`",
+        parse_mode="Markdown"
+    )
+
 if __name__ == "__main__":
     asyncio.run(main())
